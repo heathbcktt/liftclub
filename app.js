@@ -1,17 +1,17 @@
 /* Deep South Lift Club — shared lift-club token app.
-   Data lives in Firestore (or in memory with ?demo). Balances and driving shares are
-   always recalculated from the trip history, so nothing can drift out of sync. */
+   Data lives in Firestore (or in memory with ?demo). Balances are a saved summary of old
+   lifts plus a live tally of recent ones, so each visit only reads the last few weeks. */
 'use strict';
 
-const START = 5, QUIET_DAYS = 28, UNDO_MINUTES = 10;
+const START = 3, QUIET_DAYS = 28, UNDO_MINUTES = 10, KEEP_DAYS = 35, WEEKS_BACK = 2, WEEKS_AHEAD = 2;
 const COST = { both: 1, in: .5, home: .5 };
+const LEGS = { both: ['in', 'home'], in: ['in'], home: ['home'] };
 const DIRL = { both: 'There & back', in: 'Morning in only', home: 'Home only' };
 const DAYN = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 const params = new URLSearchParams(location.search);
-const DEMO = params.has('demo');
-let GID = DEMO ? 'demo' : params.get('g');
+const DEMO = params.has('demo'), SETUP = params.has('setup');
 
 /* ---------- dates ---------- */
 const pad2 = n => String(n).padStart(2, '0');
@@ -26,8 +26,14 @@ const ago = ts => { const m = Math.round((Date.now() - ts) / 60000); if (m < 1) 
 
 /* ---------- helpers ---------- */
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const fmt = n => { const neg = n < 0, a = Math.abs(n), w = Math.floor(a + 1e-9), h = a - w >= .25; return (neg ? '−' : '') + (w || !h ? w : '') + (h ? '½' : ''); };
-const rid = (n = 12) => { const c = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; const a = new Uint32Array(n); (window.crypto || {}).getRandomValues ? crypto.getRandomValues(a) : a.forEach((_, i) => a[i] = Math.random() * 4e9); a.forEach(v => s += c[v % c.length]); return s; };
+const fmt = n => { n = Math.round(n * 2) / 2; const neg = n < 0, a = Math.abs(n), w = Math.floor(a), h = a - w > 0; return (neg ? '−' : '') + (w || !h ? w : '') + (h ? '½' : ''); };
+const tk = n => `${fmt(n)} token${n === 1 ? '' : 's'}`;
+const rid = (n = 12) => { const c = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; const a = new Uint32Array(n); crypto.getRandomValues(a); let s = ''; a.forEach(v => s += c[v % c.length]); return s; };
+const ls = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) { } }
+};
+let GID = DEMO ? 'demo' : (params.get('g') || ls.get('dslc:last'));
 function pinHash(memberId, pin) { // a light deterrent, not real security: PINs only stop casual mix-ups
   const str = GID + ':' + memberId + ':' + pin; let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
   for (let i = 0; i < str.length; i++) { const ch = str.charCodeAt(i); h1 = Math.imul(h1 ^ ch, 2654435761); h2 = Math.imul(h2 ^ ch, 1597334677); }
@@ -35,28 +41,37 @@ function pinHash(memberId, pin) { // a light deterrent, not real security: PINs 
   h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
   return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
 }
-const ls = {
-  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
-  set(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) { } }
-};
 const inviteUrl = () => location.origin + location.pathname + '?g=' + GID;
+const emptySummary = () => ({ through: '', bal: {}, drives: {}, days: {} });
 
 /* ---------- stores: Firestore, or in-memory for ?demo ---------- */
 function firebaseStore() {
   firebase.initializeApp(window.FIREBASE_CONFIG);
   const db = firebase.firestore(), auth = firebase.auth();
+  db.enablePersistence({ synchronizeTabs: true }).catch(() => { }); // cache on the phone: fewer reads on return visits
   const gref = g => db.collection('groups').doc(g);
   const ref = (g, col, id) => gref(g).collection(col).doc(id);
   return {
     ready: auth.signInAnonymously(),
-    async createGroup(name) { const id = rid(10); await gref(id).set({ name, created: Date.now() }); return id; },
+    async createGroup(name) { const id = rid(10); await gref(id).set({ name, created: Date.now(), summary: emptySummary() }); return id; },
     async renameGroup(g, name) { await gref(g).update({ name }); },
     watch(g, cb, onErr) {
       const st = { group: undefined, members: [], cars: [], trips: [], log: [] }, got = new Set();
+      let through = null, unTrips = null;
       const emit = () => { if (got.size >= 5) cb(st); };
-      gref(g).onSnapshot(s => { st.group = s.exists ? s.data() : null; got.add('group'); emit(); }, onErr);
-      ['members', 'cars', 'trips'].forEach(c => gref(g).collection(c).onSnapshot(q => { st[c] = q.docs.map(d => ({ id: d.id, ...d.data() })); got.add(c); emit(); }, onErr));
-      gref(g).collection('log').orderBy('ts', 'desc').limit(40).onSnapshot(q => { st.log = q.docs.map(d => ({ id: d.id, ...d.data() })); got.add('log'); emit(); }, onErr);
+      const watchTrips = from => { // only lifts the summary doesn't already cover
+        if (unTrips) unTrips(); got.delete('trips');
+        unTrips = gref(g).collection('trips').where('date', '>=', from).onSnapshot(q => { st.trips = q.docs.map(d => ({ id: d.id, ...d.data() })); got.add('trips'); emit(); }, onErr);
+      };
+      gref(g).onSnapshot(s => {
+        st.group = s.exists ? s.data() : null; got.add('group');
+        const t = st.group && st.group.summary ? st.group.summary.through : '';
+        if (st.group && t !== through) { through = t; watchTrips(t); }
+        if (!st.group) got.add('trips');
+        emit();
+      }, onErr);
+      ['members', 'cars'].forEach(c => gref(g).collection(c).onSnapshot(q => { st[c] = q.docs.map(d => ({ id: d.id, ...d.data() })); got.add(c); emit(); }, onErr));
+      gref(g).collection('log').orderBy('ts', 'desc').limit(20).onSnapshot(q => { st.log = q.docs.map(d => ({ id: d.id, ...d.data() })); got.add('log'); emit(); }, onErr);
     },
     tx(g, reads, fn) {
       return db.runTransaction(async t => {
@@ -66,17 +81,26 @@ function firebaseStore() {
         for (const w of writes) { const rf = ref(g, w.col, w.id); w.data === null ? t.delete(rf) : t.set(rf, w.data); }
         return writes;
       });
+    },
+    // Fold lifts older than `until` into the group's saved summary, so later visits never read them again.
+    async rollup(g, until) {
+      const cur = ((await gref(g).get()).data() || {}).summary || emptySummary();
+      if (cur.through >= until) return;
+      const q = await gref(g).collection('trips').where('date', '>=', cur.through).where('date', '<', until).get();
+      const add = tally(q.docs.map(d => ({ id: d.id, ...d.data() })), until);
+      await db.runTransaction(async t => {
+        const s = await t.get(gref(g)); const now = (s.data() || {}).summary || emptySummary();
+        if (now.through !== cur.through) return; // someone else already did it
+        t.update(gref(g), { summary: mergeSummary(now, add, until) });
+      });
     }
   };
 }
 function memoryStore(seed) {
   const db = { members: {}, cars: {}, trips: {}, log: {} }; let group = seed.group, cb = null;
   ['members', 'cars', 'trips', 'log'].forEach(c => seed[c].forEach(d => { const { id, ...rest } = d; db[c][id] = JSON.parse(JSON.stringify(rest)); }));
-  const snap = () => ({
-    group, members: Object.entries(db.members).map(([id, d]) => ({ id, ...d })), cars: Object.entries(db.cars).map(([id, d]) => ({ id, ...d })),
-    trips: Object.entries(db.trips).map(([id, d]) => ({ id, ...d })), log: Object.entries(db.log).map(([id, d]) => ({ id, ...d })).sort((a, b) => b.ts - a.ts).slice(0, 40)
-  });
-  const notify = () => cb && setTimeout(() => cb(JSON.parse(JSON.stringify(snap()))), 0);
+  const arr = c => Object.entries(db[c]).map(([id, d]) => ({ id, ...d }));
+  const notify = () => cb && setTimeout(() => cb(JSON.parse(JSON.stringify({ group, members: arr('members'), cars: arr('cars'), trips: arr('trips').filter(t => t.date >= group.summary.through), log: arr('log').sort((a, b) => b.ts - a.ts).slice(0, 20) }))), 0);
   return {
     ready: Promise.resolve(),
     async createGroup() { return 'demo'; },
@@ -87,68 +111,103 @@ function memoryStore(seed) {
       const writes = fn(docs);
       writes.forEach(w => { if (w.data === null) delete db[w.col][w.id]; else db[w.col][w.id] = JSON.parse(JSON.stringify(w.data)); });
       notify(); return writes;
+    },
+    async rollup(g, until) {
+      if (group.summary.through >= until) return;
+      const add = tally(arr('trips').filter(t => t.date >= group.summary.through && t.date < until), until);
+      group = { ...group, summary: mergeSummary(group.summary, add, until) }; notify();
     }
   };
 }
 
 /* ---------- state ---------- */
-let store = null, S = null, loadErr = null;
+let store = null, S = null, loadErr = null, rolledUp = false;
 let ui = { tab: 'week', week: 0, sheet: null, toast: null, pin: '', pinFor: null, pinErr: false, confirm: null };
 const meKey = () => 'dslc:me:' + GID;
-const me = () => S && S.meId && S.members.find(m => m.id === S.meId) ? S.meId : null;
+const me = () => S && S.meId && S.members.some(m => m.id === S.meId && !m.deleted) ? S.meId : null;
 const mem = id => S.members.find(m => m.id === id);
+const people = () => S.members.filter(m => !m.deleted);
 const carOf = m => m && m.carId ? S.cars.find(c => c.id === m.carId) || null : null;
 const nick = id => (mem(id) || { nick: 'Someone' }).nick;
 const tripById = id => S.trips.find(t => t.id === id);
 
 /* ---------- token & seat logic ---------- */
+// Seats are counted per direction: a car can be full on the way in but have space going home.
 function alloc(t) {
-  const c = cutoff(t.date);
+  const c = cutoff(t.date), tl = LEGS[t.dir];
   const rs = (t.riders || []).map(r => ({ ...r, late: r.ts > c }));
   rs.sort((a, b) => (a.late - b.late) || ((b.prio ? 1 : 0) - (a.prio ? 1 : 0)) || (a.ts - b.ts));
-  return { conf: rs.slice(0, t.seats), wait: rs.slice(t.seats) };
-}
-function ledger() {
-  const b = {}; S.members.forEach(m => b[m.id] = START);
-  for (const t of S.trips) {
-    if (t.date >= TODAY || !(t.driverId in b)) continue;
-    for (const r of alloc(t).conf) { if (r.noShow || !(r.id in b)) continue; const c = COST[r.dir]; b[r.id] -= c; b[t.driverId] += c; }
+  const used = { in: 0, home: 0 }, conf = [], wait = [];
+  for (const r of rs) {
+    const lg = LEGS[r.dir].filter(l => tl.includes(l));
+    if (lg.length && lg.every(l => used[l] < t.seats)) { lg.forEach(l => used[l]++); conf.push(r); } else wait.push(r);
   }
+  return { conf, wait, used };
+}
+function tally(trips, until) {
+  const bal = {}, drives = {}, days = {}, add = (o, k, v) => o[k] = (o[k] || 0) + v;
+  for (const t of trips) {
+    if (t.date >= until) continue;
+    const conf = alloc(t).conf.filter(r => !r.noShow);
+    for (const r of conf) { const c = COST[r.dir]; add(bal, r.id, -c); add(bal, t.driverId, c); add(days, r.id, c); }
+    if (conf.length) { add(drives, t.driverId, COST[t.dir]); add(days, t.driverId, COST[t.dir]); }
+  }
+  return { bal, drives, days };
+}
+function mergeSummary(a, b, through) {
+  const m = { through, bal: { ...a.bal }, drives: { ...a.drives }, days: { ...a.days } };
+  ['bal', 'drives', 'days'].forEach(k => Object.entries(b[k]).forEach(([id, v]) => m[k][id] = (m[k][id] || 0) + v));
+  return m;
+}
+const summary = () => (S.group && S.group.summary) || emptySummary();
+function ledger() {
+  const sm = summary(), live = tally(S.trips, TODAY), b = {};
+  S.members.forEach(m => b[m.id] = START + (sm.bal[m.id] || 0) + (live.bal[m.id] || 0));
   return b;
 }
 function committed(id) { let s = 0; for (const t of S.trips) { if (t.date < TODAY) continue; const r = (t.riders || []).find(x => x.id === id); if (r) s += COST[r.dir]; } return s; }
 function lastSeen(id) { let last = null; for (const t of S.trips) { if (t.driverId === id || (t.riders || []).some(r => r.id === id)) { if (!last || t.date > last) last = t.date; } } return last; }
 function isActive(m) { const cut = ymd(addDays(new Date(), -QUIET_DAYS)); const l = lastSeen(m.id); return (l && l >= cut) || (m.joined || '') >= cut; }
 function driveStats() {
-  const st = {}; S.members.forEach(m => { if (m.carId) st[m.id] = { drives: 0, days: 0 }; });
-  for (const t of S.trips) {
-    if (t.date >= TODAY) continue;
-    const conf = alloc(t).conf.filter(r => !r.noShow);
-    if (st[t.driverId] && conf.length) { st[t.driverId].drives += COST[t.dir]; st[t.driverId].days += COST[t.dir]; }
-    for (const r of conf) if (st[r.id]) st[r.id].days += COST[r.dir];
-  }
+  const sm = summary(), live = tally(S.trips, TODAY);
   let D = 0, N = 0;
-  const list = S.members.filter(m => m.carId && isActive(m)).map(m => { const s = st[m.id]; D += s.drives; N += s.days; return { id: m.id, ...s, ratio: s.days ? s.drives / s.days : null }; });
+  const list = people().filter(m => m.carId && isActive(m)).map(m => {
+    const drives = (sm.drives[m.id] || 0) + (live.drives[m.id] || 0), days = (sm.days[m.id] || 0) + (live.days[m.id] || 0);
+    D += drives; N += days; return { id: m.id, drives, days, ratio: days ? drives / days : null };
+  });
   const avg = N ? D / N : 0;
   list.forEach(x => { if (x.ratio === null) x.ratio = avg; });
   list.sort((a, b) => a.ratio - b.ratio || b.days - a.days);
   return { list, avg };
 }
+// Which directions this person already has covered on a day, in other cars (as driver or passenger).
+function legsTaken(id, date, exceptTrip) {
+  const s = new Set();
+  S.trips.forEach(t => {
+    if (t.date !== date || t.id === exceptTrip) return;
+    if (t.driverId === id) LEGS[t.dir].forEach(l => s.add(l));
+    const r = alloc(t).conf.find(x => x.id === id); if (r) LEGS[r.dir].forEach(l => s.add(l)); // waitlist spots don't count
+  });
+  return s;
+}
+const dirFromLegs = lg => lg.includes('in') && lg.includes('home') ? 'both' : lg.includes('in') ? 'in' : lg.includes('home') ? 'home' : null;
+const dirOptions = open => open.length === 2 ? ['both', 'in', 'home'] : open.length === 1 ? [open[0]] : [];
 
 /* ---------- writing: every change is a transaction plus a log entry that can undo it ---------- */
-async function act(text, reads, fn, toastText) {
-  const who = me(); ui.sheet = null; ui.confirm = null; render();
+async function act(text, reads, fn, toastText, opts = {}) {
+  const who = me() || opts.who || ''; ui.sheet = null; ui.confirm = null; render();
   try {
     const w = await store.tx(GID, reads, docs => {
       const writes = fn(docs) || [];
       if (!writes.length) return [];
       const before = {};
       writes.forEach(x => { const k = x.col + '/' + x.id; before[k] = k in docs ? docs[k] : null; });
-      writes.push({ col: 'log', id: rid(), data: { ts: Date.now(), who: who || writes.find(x => x.col === 'members')?.id || '', text, before: JSON.stringify(before), undone: false } });
+      writes.push({ col: 'log', id: rid(), data: { ts: Date.now(), who, text, before: opts.noUndo ? '{}' : JSON.stringify(before), undone: !!opts.noUndo } });
       return writes;
     });
     if (w.length) toast(toastText || ('You ' + text));
-  } catch (e) { console.error(e); toast(e.userMsg || 'That didn\'t save. Check your connection and try again.'); }
+    return true;
+  } catch (e) { console.error(e); toast(e.userMsg || 'That didn\'t save. Check your connection and try again.'); return false; }
 }
 const fail = msg => { const e = new Error(msg); e.userMsg = msg; throw e; };
 function toast(t) { ui.toast = t; clearTimeout(toast.h); render(); toast.h = setTimeout(() => { ui.toast = null; render(); }, 2800); }
@@ -158,25 +217,27 @@ const val = id => { const e = document.getElementById(id); return e ? e.value : 
 function keepForm() { if (!ui.sheet) return; ['nick', 'plate', 'pin', 'share', 'gname'].forEach(k => { const e = document.getElementById('f-' + k); if (e) ui.sheet[k] = e.value; }); }
 
 const H = {
-  tab: v => { ui.tab = v; ui.sheet = null; render(); window.scrollTo(0, 0); },
-  week: v => { ui.week = Math.max(-2, Math.min(3, ui.week + Number(v))); render(); },
+  tab: v => { ui.tab = v; ui.sheet = null; ui.confirm = null; render(); window.scrollTo(0, 0); },
+  week: v => { ui.week = Math.max(-WEEKS_BACK, Math.min(WEEKS_AHEAD, ui.week + Number(v))); render(); },
   closeSheet: () => { ui.sheet = null; ui.confirm = null; render(); },
   noop: () => { },
 
-  join: id => {
-    const t = tripById(id), m = me(); if (!t || !m) return;
-    const other = S.trips.find(x => x.date === t.date && x.id !== id && (x.riders || []).some(r => r.id === m));
+  join: (id, el) => {
+    const dir = el.dataset.d, t = tripById(id), m = me(); if (!t || !m) return;
     const prio = (ledger()[m] - committed(m)) > 0;
-    const willWait = alloc({ ...t, riders: [...(t.riders || []), { id: m, ts: Date.now(), prio }] }).wait.some(r => r.id === m);
-    const reads = [{ col: 'trips', id }]; if (other) reads.push({ col: 'trips', id: other.id });
-    act(`joined ${nick(t.driverId)}'s car for ${dLabel(t.date)}`, reads, docs => {
+    const willWait = alloc({ ...t, riders: [...(t.riders || []), { id: m, ts: Date.now(), prio, dir }] }).wait.some(r => r.id === m);
+    const what = dir === 'both' ? '' : dir === 'in' ? ' (in only)' : ' (home only)';
+    // a waitlist spot elsewhere for the same direction gets dropped when you take this seat
+    const others = S.trips.filter(x => x.date === t.date && x.id !== id && (x.riders || []).some(r => r.id === m && LEGS[r.dir].some(l => LEGS[dir].includes(l))));
+    act(`joined ${nick(t.driverId)}'s car for ${dLabel(t.date)}${what}`, [{ col: 'trips', id }, ...others.map(x => ({ col: 'trips', id: x.id }))], docs => {
       const T = docs['trips/' + id]; if (!T) fail('That lift has been cancelled.');
       if ((T.riders || []).some(r => r.id === m)) return [];
       const beforeConf = new Set(alloc(T).conf.map(r => r.id));
-      const nt = { ...T, riders: [...(T.riders || []), { id: m, ts: Date.now(), prio, dir: T.dir }] };
-      const w = [{ col: 'trips', id, data: nt }];
-      if (other) { const O = docs['trips/' + other.id]; if (O) w.push({ col: 'trips', id: other.id, data: { ...O, riders: O.riders.filter(r => r.id !== m) } }); }
-      const after = new Set(alloc(nt).conf.map(r => r.id));
+      const nt = { ...T, riders: [...(T.riders || []), { id: m, ts: Date.now(), prio, dir }] };
+      const w = [{ col: 'trips', id, data: nt }], after = new Set(alloc(nt).conf.map(r => r.id));
+      others.forEach(x => { const O = docs['trips/' + x.id]; if (!O) return;
+        const riders = O.riders.map(r => r.id !== m ? r : { ...r, dir: dirFromLegs(LEGS[r.dir].filter(l => !LEGS[dir].includes(l))) }).filter(r => r.dir);
+        w.push({ col: 'trips', id: x.id, data: { ...O, riders } }); });
       [...beforeConf].filter(x => !after.has(x)).forEach(x => w.push({ col: 'log', id: rid(), data: { ts: Date.now() + 1, who: x, text: `moved to the waitlist in ${nick(T.driverId)}'s car (someone with tokens took the seat)`, before: '{}', undone: true } }));
       return w;
     }, willWait ? "You're on the waitlist" : `You're in ${nick(t.driverId)}'s car`);
@@ -202,17 +263,21 @@ const H = {
   sdir: v => { ui.sheet.dir = v; render(); },
   sseat: v => { const max = carOf(mem(me())).cap - 1; ui.sheet.seats = Math.max(1, Math.min(max, ui.sheet.seats + Number(v))); render(); },
   savePost: () => {
-    const s = { ...ui.sheet }, m = me();
+    const s = { ...ui.sheet }, m = me(), dl = LEGS[s.dir];
+    const fit = riders => riders.map(r => ({ ...r, dir: dirFromLegs(LEGS[r.dir].filter(l => dl.includes(l))) })).filter(r => r.dir);
     if (s.trip) {
       act(`updated your lift for ${dLabel(s.date)}`, [{ col: 'trips', id: s.trip }], docs => {
         const T = docs['trips/' + s.trip]; if (!T) fail('That lift no longer exists.');
-        return [{ col: 'trips', id: s.trip, data: { ...T, dir: s.dir, seats: s.seats, riders: T.riders.map(r => s.dir !== 'both' ? { ...r, dir: s.dir } : r) } }];
+        return [{ col: 'trips', id: s.trip, data: { ...T, dir: s.dir, seats: s.seats, riders: fit(T.riders || []) } }];
       }, 'Lift updated');
     } else {
-      const mine = S.trips.filter(x => x.date === s.date && (x.riders || []).some(r => r.id === m));
+      // If you were down as a passenger in the same direction, driving replaces that seat.
+      const mine = S.trips.filter(x => x.date === s.date && (x.riders || []).some(r => r.id === m && LEGS[r.dir].some(l => dl.includes(l))));
       act(`offered a lift for ${dLabel(s.date)}`, mine.map(x => ({ col: 'trips', id: x.id })), docs => {
         const w = [{ col: 'trips', id: rid(), data: { date: s.date, driverId: m, dir: s.dir, seats: s.seats, riders: [], created: Date.now() } }];
-        mine.forEach(x => { const O = docs['trips/' + x.id]; if (O) w.push({ col: 'trips', id: x.id, data: { ...O, riders: O.riders.filter(r => r.id !== m) } }); });
+        mine.forEach(x => { const O = docs['trips/' + x.id]; if (!O) return;
+          const riders = O.riders.map(r => r.id !== m ? r : { ...r, dir: dirFromLegs(LEGS[r.dir].filter(l => !dl.includes(l))) }).filter(r => r.dir);
+          w.push({ col: 'trips', id: x.id, data: { ...O, riders } }); });
         return w;
       }, 'Lift posted. People can hop in now.');
     }
@@ -242,7 +307,7 @@ const H = {
 
   // members & cars
   addSheet: () => { ui.sheet = { type: 'member', car: 'none', cap: 5 }; render(); },
-  memberSheet: id => { const m = mem(id), c = carOf(m); const shared = c && S.members.some(x => x.id !== id && x.carId === c.id);
+  memberSheet: id => { const m = mem(id), c = carOf(m); const shared = c && people().some(x => x.id !== id && x.carId === c.id);
     ui.sheet = { type: 'member', edit: id, nick: m.nick, car: !c ? 'none' : shared ? 'share' : 'own', plate: c ? c.plate : '', cap: c ? c.cap : 5, share: c ? c.id : '' }; render(); },
   acar: v => { keepForm(); ui.sheet.car = v; ui.sheet.err = null; render(); },
   acap: v => { keepForm(); ui.sheet.cap = Math.max(3, Math.min(7, ui.sheet.cap + Number(v))); render(); },
@@ -250,29 +315,47 @@ const H = {
     keepForm(); const s = ui.sheet, n = (s.nick || '').trim(), fresh = !me() && !s.edit;
     const err = msg => { ui.sheet.err = msg; render(); };
     if (!n) return err('Add a nickname first.');
-    if (S.members.some(m => m.id !== s.edit && m.nick.toLowerCase() === n.toLowerCase())) return err(`There's already someone called ${n}. Try another nickname.`);
+    if (/^former member$/i.test(n)) return err('Pick a different nickname.');
+    if (people().some(m => m.id !== s.edit && m.nick.toLowerCase() === n.toLowerCase())) return err(`There's already someone called ${n}. Try another nickname.`);
     if (fresh && !/^\d{4}$/.test(s.pin || '')) return err('Pick a PIN of exactly four numbers.');
     if (s.car === 'share' && !s.share) return err('Choose whose car it is.');
     const id = s.edit || rid(), old = s.edit ? mem(s.edit) : null, oldCar = old ? carOf(old) : null;
-    const oldCarShared = oldCar && S.members.some(x => x.id !== id && x.carId === oldCar.id);
+    const oldCarShared = oldCar && people().some(x => x.id !== id && x.carId === oldCar.id);
     const writes = []; let carId = null;
     if (s.car === 'own') {
       const plate = ((s.plate || '').trim() || 'Car').toUpperCase().slice(0, 12);
-      if (oldCar && !oldCarShared) { carId = oldCar.id; writes.push({ col: 'cars', id: carId, data: { plate, cap: s.cap } }); }
-      else { carId = rid(); writes.push({ col: 'cars', id: carId, data: { plate, cap: s.cap } }); }
+      carId = oldCar && !oldCarShared ? oldCar.id : rid();
+      writes.push({ col: 'cars', id: carId, data: { plate, cap: s.cap } });
     } else if (s.car === 'share') carId = s.share;
     const data = old ? { ...stripId(old), nick: n, carId } : { nick: n, carId, joined: TODAY, pinHash: fresh ? pinHash(id, s.pin) : null };
     writes.push({ col: 'members', id, data });
-    const reads = writes.map(w => ({ col: w.col, id: w.id }));
     if (fresh) { S.meId = id; ls.set(meKey(), id); }
-    act(fresh ? 'joined the group' : s.edit ? (s.edit === me() ? 'updated your details' : `updated ${n}'s details`) : `added ${n} to the group`, reads, () => writes,
-      fresh ? `Welcome, ${n}` : s.edit ? 'Saved' : `${n} added. They can log in from the invite link.`);
+    act(fresh ? 'joined the group' : s.edit ? (s.edit === me() ? 'updated your details' : `updated ${n}'s details`) : `added ${n} to the group`, writes.map(w => ({ col: w.col, id: w.id })), () => writes,
+      fresh ? `Welcome, ${n}` : s.edit ? 'Saved' : `${n} added. They can log in from the invite link.`, { who: id });
   },
   resetPin: () => {
     if (ui.confirm !== 'pin') { ui.confirm = 'pin'; render(); return; }
     const id = ui.sheet.edit;
     act(`reset ${nick(id)}'s PIN`, [{ col: 'members', id }], docs => docs['members/' + id] ? [{ col: 'members', id, data: { ...docs['members/' + id], pinHash: null } }] : [],
       `${nick(id)} can choose a new PIN next time they log in`);
+  },
+  deleteMe: async () => {
+    if (ui.confirm !== 'delete') { ui.confirm = 'delete'; render(); return; }
+    const m = me(), mm = mem(m), car = carOf(mm), carShared = car && people().some(x => x.id !== m && x.carId === car.id);
+    const upcoming = S.trips.filter(t => t.date >= TODAY && (t.driverId === m || (t.riders || []).some(r => r.id === m)));
+    const reads = [{ col: 'members', id: m }, ...upcoming.map(t => ({ col: 'trips', id: t.id }))];
+    if (car && !carShared) reads.push({ col: 'cars', id: car.id });
+    const ok = await act('left the lift club', reads, docs => {
+      const M = docs['members/' + m]; if (!M) return [];
+      // Past lifts stay so everyone else's balances don't change; the name goes.
+      const w = [{ col: 'members', id: m, data: { nick: 'Former member', deleted: true, carId: null, pinHash: null, joined: M.joined || '', left: TODAY } }];
+      upcoming.forEach(t => { const T = docs['trips/' + t.id]; if (!T) return;
+        if (T.driverId === m) w.push({ col: 'trips', id: t.id, data: null });
+        else w.push({ col: 'trips', id: t.id, data: { ...T, riders: T.riders.filter(r => r.id !== m) } }); });
+      if (car && !carShared && docs['cars/' + car.id]) w.push({ col: 'cars', id: car.id, data: null });
+      return w;
+    }, 'Your profile has been deleted', { noUndo: true });
+    if (ok) { ls.set(meKey(), null); S.meId = null; ui.tab = 'week'; render(); }
   },
 
   // login
@@ -284,9 +367,9 @@ const H = {
     if (ui.pin.length === 4) {
       const m = mem(ui.pinFor), h = pinHash(m.id, ui.pin);
       if (!m.pinHash) {
-        S.meId = m.id; ls.set(meKey(), m.id);
-        act('set a new PIN', [{ col: 'members', id: m.id }], docs => [{ col: 'members', id: m.id, data: { ...docs['members/' + m.id], pinHash: h } }], `Hi ${m.nick}. Your PIN is set, and you'll stay logged in on this phone.`);
-        ui.pinFor = null; ui.pin = ''; ui.tab = 'week'; render(); return;
+        S.meId = m.id; ls.set(meKey(), m.id); ui.pinFor = null; ui.pin = ''; ui.tab = 'week';
+        act('set a new PIN', [{ col: 'members', id: m.id }], docs => [{ col: 'members', id: m.id, data: { ...docs['members/' + m.id], pinHash: h } }], `Hi ${m.nick}. Your PIN is set, and you'll stay logged in on this phone.`, { noUndo: true });
+        return;
       }
       if (h === m.pinHash) { S.meId = m.id; ls.set(meKey(), m.id); ui.pinFor = null; ui.pin = ''; ui.tab = 'week'; toast(`Hi ${m.nick}. You'll stay logged in on this phone.`); return; }
       ui.pin = ''; ui.pinErr = true;
@@ -297,10 +380,10 @@ const H = {
   logout: () => { if (ui.confirm !== 'logout') { ui.confirm = 'logout'; render(); return; } ls.set(meKey(), null); S.meId = null; ui.confirm = null; ui.tab = 'week'; render(); },
   guideSheet: () => { ui.sheet = { type: 'guide' }; render(); },
 
-  // groups
+  // group
   copy: () => {
-    const t = inviteUrl(), done = () => toast('Invite link copied. Paste it in the WhatsApp group.');
-    try { navigator.clipboard.writeText(t).then(done, () => { selectText(document.getElementById('invite')); toast('Press and hold the link to copy it'); }); }
+    const done = () => toast('Invite link copied. Paste it in the WhatsApp group.');
+    try { navigator.clipboard.writeText(inviteUrl()).then(done, () => { selectText(document.getElementById('invite')); toast('Press and hold the link to copy it'); }); }
     catch (e) { selectText(document.getElementById('invite')); }
   },
   renameSheet: () => { ui.sheet = { type: 'rename', gname: S.group.name }; render(); },
@@ -309,7 +392,7 @@ const H = {
   createGroup: () => {
     const n = val('f-gname').trim().slice(0, 40); if (!n) { ui.landErr = 'Give your lift club a name.'; render(); return; }
     ui.creating = true; render();
-    store.createGroup(n).then(id => { location.search = '?g=' + id; }, e => { console.error(e); ui.creating = false; ui.landErr = 'Couldn\'t create the group. Check your connection and the setup steps.'; render(); });
+    store.createGroup(n).then(id => { location.search = '?g=' + id; }, e => { console.error(e); ui.creating = false; ui.landErr = 'Couldn\'t create the group. New groups are switched off in the security rules (see SETUP.md).'; render(); });
   },
 };
 function stripId(o) { const { id, ...r } = o; return r; }
@@ -331,7 +414,7 @@ function render() {
   const app = document.getElementById('app'); let h = '';
   if (loadErr) h = viewMessage('Can\'t reach the lift club', loadErr);
   else if (!store) h = viewMessage('Almost ready', 'The app hasn\'t been connected to Firebase yet. Follow SETUP.md to paste your Firebase settings into firebase-config.js. To try it with sample data, add <code>?demo</code> to the end of the address.');
-  else if (!GID) h = viewLanding();
+  else if (!GID) h = SETUP ? viewSetup() : viewMessage('Open your invite link', 'To get into the lift club, open the invite link someone shared in your WhatsApp group.');
   else if (!S) h = `<p class="quiet" style="padding:40px 0">Loading…</p>`;
   else if (S.group === null) h = viewMessage('This link doesn\'t work', 'The lift club couldn\'t be found. Ask someone in the group to copy the invite link again from the Group page.');
   else {
@@ -353,20 +436,17 @@ function render() {
 }
 function viewMessage(title, body) { return `<div class="center"><h1>${esc(title)}</h1><p style="margin:0;color:var(--muted)">${body}</p></div>`; }
 
-function viewLanding() {
-  const last = ls.get('dslc:last');
-  return `<div class="center"><h1>Start a lift club</h1>
-    <p style="margin:0;color:var(--muted)">Already in one? Open the invite link someone shared in your WhatsApp group.</p>
-    ${last ? `<a class="btn sec block" href="?g=${esc(last)}">Open my lift club</a>` : ''}
-    <div class="field"><label for="f-gname">Name of the new lift club</label><input id="f-gname" maxlength="40" placeholder="Deep South Lift Club" autocomplete="off"></div>
+function viewSetup() {
+  return `<div class="center"><h1>Create the lift club</h1>
+    <p style="margin:0;color:var(--muted)">This only works while new groups are switched on in the security rules. Switch them off again afterwards.</p>
+    <div class="field"><label for="f-gname">Name</label><input id="f-gname" maxlength="40" value="Deep South Lift Club" autocomplete="off"></div>
     ${ui.landErr ? `<p class="err">${esc(ui.landErr)}</p>` : ''}
-    <button class="btn pri block" data-a="createGroup" ${ui.creating ? 'disabled' : ''}>${ui.creating ? 'Creating…' : 'Create lift club'}</button>
-    <p class="note">You'll get an invite link to share. Everyone in the group can add people, so there's no admin.</p></div>`;
+    <button class="btn pri block" data-a="createGroup" ${ui.creating ? 'disabled' : ''}>${ui.creating ? 'Creating…' : 'Create lift club'}</button></div>`;
 }
 
 function viewLogin() {
   if (ui.pinFor) {
-    const m = mem(ui.pinFor); if (!m) { ui.pinFor = null; return viewLogin(); }
+    const m = mem(ui.pinFor); if (!m || m.deleted) { ui.pinFor = null; return viewLogin(); }
     const dots = [0, 1, 2, 3].map(i => `<span class="${i < ui.pin.length ? 'on' : ''}"></span>`).join('');
     return `<div class="login"><button class="link" data-a="backPick" style="align-self:flex-start">‹ Not ${esc(m.nick)}?</button>
       <h1>Hi ${esc(m.nick)}</h1><p class="note" style="margin:0">${m.pinHash ? 'Enter your 4-digit PIN.' : 'Choose a 4-digit PIN. You\'ll only need it if you log in on another phone.'}</p>
@@ -374,19 +454,19 @@ function viewLogin() {
       ${ui.pinErr ? '<p class="err" style="text-align:center">That PIN doesn\'t match. Forgotten it? Anyone in the group can reset it from the Group page.</p>' : ''}
       <div class="pad">${['1', '2', '3', '4', '5', '6', '7', '8', '9', '', '0', 'del'].map(k => k === '' ? '<span></span>' : `<button data-a="pinKey" data-v="${k}" aria-label="${k === 'del' ? 'Delete' : k}">${k === 'del' ? '⌫' : k}</button>`).join('')}</div></div>`;
   }
-  const act = S.members.filter(isActive).sort((a, b) => a.nick.localeCompare(b.nick)), q = S.members.filter(m => !isActive(m));
+  const all = people(), act = all.filter(isActive).sort((a, b) => a.nick.localeCompare(b.nick)), q = all.filter(m => !isActive(m));
   return `<div class="login"><h1>${esc(S.group.name)}</h1>
-    ${S.members.length ? '<p style="margin:0;color:var(--muted)">Who are you? Tap your nickname.</p>' : '<p style="margin:0;color:var(--muted)">Nobody has joined yet. Be the first.</p>'}
+    ${all.length ? '<p style="margin:0;color:var(--muted)">Who are you? Tap your nickname.</p>' : '<p style="margin:0;color:var(--muted)">Nobody has joined yet. Be the first.</p>'}
     <div class="names">${act.map(m => `<button data-a="pick" data-v="${m.id}">${esc(m.nick)}</button>`).join('')}</div>
     ${q.length ? `<details><summary>Haven't been in for a while (${q.length})</summary><div class="names">${q.map(m => `<button data-a="pick" data-v="${m.id}">${esc(m.nick)}</button>`).join('')}</div></details>` : ''}
-    <button class="btn ${S.members.length ? 'ghost' : 'pri'} block" data-a="newMe">I'm new here</button>
+    <button class="btn ${all.length ? 'ghost' : 'pri'} block" data-a="newMe">I'm new here</button>
     <button class="link" data-a="guideSheet">How does this work?</button></div>`;
 }
 
 function viewWeek() {
   const mon = addDays(mondayOf(new Date()), ui.week * 7), fri = addDays(mon, 4);
-  const label = { '-2': 'Two weeks ago', '-1': 'Last week', '0': 'This week', '1': 'Next week' }[ui.week] || `In ${ui.week} weeks`;
-  let h = `<div class="weeknav"><button data-a="week" data-v="-1" aria-label="Previous week" ${ui.week <= -2 ? 'disabled' : ''}>‹</button><h2>${label} · ${mon.getDate()} ${MON[mon.getMonth()]} – ${fri.getDate()} ${MON[fri.getMonth()]}</h2><button data-a="week" data-v="1" aria-label="Next week" ${ui.week >= 3 ? 'disabled' : ''}>›</button></div>`;
+  const label = { '-2': 'Two weeks ago', '-1': 'Last week', '0': 'This week', '1': 'Next week', '2': 'In two weeks' }[ui.week];
+  let h = `<div class="weeknav"><button data-a="week" data-v="-1" aria-label="Previous week" ${ui.week <= -WEEKS_BACK ? 'disabled' : ''}>‹</button><h2>${label} · ${mon.getDate()} ${MON[mon.getMonth()]} – ${fri.getDate()} ${MON[fri.getMonth()]}</h2><button data-a="week" data-v="1" aria-label="Next week" ${ui.week >= WEEKS_AHEAD ? 'disabled' : ''}>›</button></div>`;
   const m = mem(me()), myCar = carOf(m), stats = driveStats();
   for (let i = 0; i < 5; i++) {
     const ds = ymd(addDays(mon, i)), past = ds < TODAY;
@@ -412,8 +492,9 @@ function viewWeek() {
 }
 
 function tripCard(t, past) {
-  const { conf, wait } = alloc(t), d = mem(t.driverId), car = carOf(d), m = me(), mineDrive = t.driverId === m;
-  const myR = (t.riders || []).find(r => r.id === m), beforeCut = Date.now() < cutoff(t.date);
+  const { conf, wait, used } = alloc(t), d = mem(t.driverId), car = carOf(d), m = me(), mineDrive = t.driverId === m;
+  const myR = (t.riders || []).find(r => r.id === m), beforeCut = Date.now() < cutoff(t.date), tl = LEGS[t.dir];
+  const free = { in: t.seats - used.in, home: t.seats - used.home };
   const chip = (r, kind) => {
     const isMe = r.id === m, prov = kind === 'conf' && !r.prio && beforeCut && !past;
     const extra = r.dir !== t.dir ? `<small>${r.dir === 'in' ? 'in only' : 'home only'}</small>` : '';
@@ -422,8 +503,16 @@ function tripCard(t, past) {
     if (!past && isMe) return `<button class="${cls}" data-a="riderSheet" data-v="${t.id}">${label} ▾</button>`;
     return `<span class="${cls}">${label}</span>`;
   };
-  const dots = Array.from({ length: t.seats }, (_, i) => `<span class="seat ${i < conf.length ? 'on' : ''}"></span>`).join('');
-  const tk = n => `${fmt(n)} token${n === 1 ? '' : 's'}`;
+  // seat dots: one row per direction when the two directions differ
+  const dotRow = n => Array.from({ length: t.seats }, (_, i) => `<span class="seat ${i < n ? 'on' : ''}"></span>`).join('');
+  const split = t.dir === 'both' && used.in !== used.home;
+  const dots = split ? `<span class="legdots"><span><small>In</small>${dotRow(used.in)}</span><span><small>Home</small>${dotRow(used.home)}</span></span>` : dotRow(Math.max(used.in, used.home));
+  const seatText = () => {
+    const s = n => `${n} seat${n === 1 ? '' : 's'}`;
+    if (t.dir !== 'both') { const f = free[t.dir]; return f > 0 ? `${s(f)} left` : 'Full'; }
+    if (free.in === free.home) return free.in > 0 ? `${s(free.in)} left` : 'Full';
+    return `${free.in > 0 ? s(free.in) : 'Full'} in, ${free.home > 0 ? s(free.home) : 'full'} home`;
+  };
   let foot = '';
   if (past) {
     const earned = conf.filter(r => !r.noShow).reduce((s, r) => s + COST[r.dir], 0);
@@ -431,19 +520,20 @@ function tripCard(t, past) {
     else if (myR && !myR.noShow && conf.some(r => r.id === m)) foot = `<span class="note">You paid ${tk(COST[myR.dir])}</span>`;
     else foot = `<span class="note">${esc(d.nick)} earned ${fmt(earned)}</span>`;
   } else if (mineDrive) {
-    foot = `<span class="note">${t.date === TODAY ? 'Tokens move automatically tonight.' : `${conf.length} of ${t.seats} seats taken`}</span><button class="btn ghost" data-a="editTrip" data-v="${t.id}">Edit</button>`;
+    foot = `<span class="note">${t.date === TODAY ? 'Tokens move automatically tonight.' : seatText()}</span><button class="btn ghost" data-a="editTrip" data-v="${t.id}">Edit</button>`;
   } else if (myR) {
     const inConf = conf.some(r => r.id === m), prov = inConf && !myR.prio && beforeCut;
     foot = `<span class="note">${!inConf ? 'You\'re on the waitlist. You\'ll get a seat if one opens up.' : prov ? 'Your seat is held until 9pm the night before. Someone with tokens could still take it.' : `You're in. ${tk(COST[myR.dir])}.`}</span><button class="btn ghost" data-a="leave" data-v="${t.id}">Leave</button>`;
   } else {
-    const full = conf.length >= t.seats, left = t.seats - conf.length;
-    const seatedElsewhere = S.trips.some(x => x.date === t.date && x.id !== t.id && alloc(x).conf.some(r => r.id === m));
-    const btn = seatedElsewhere ? (full ? '' : `<button class="btn ghost" data-a="join" data-v="${t.id}">Switch to this car</button>`)
-      : `<button class="btn ${full ? 'ghost' : 'pri'}" data-a="join" data-v="${t.id}">${full ? 'Join waitlist' : "I'm in"}</button>`;
-    foot = `<span class="note">${full ? 'Full' : `${left} seat${left === 1 ? '' : 's'} left`}</span>${btn}`;
+    // offer only the directions you haven't already got covered in another car
+    const taken = legsTaken(m, t.date, t.id), opts = dirOptions(tl.filter(l => !taken.has(l)));
+    const label = { both: 'There & back · 1', in: 'In · ½', home: 'Home · ½' };
+    const btns = opts.map(o => { const full = LEGS[o].some(l => free[l] <= 0);
+      return `<button class="btn ${full ? 'ghost' : o === 'both' ? 'pri' : 'sec'}" data-a="join" data-v="${t.id}" data-d="${o}">${label[o]}${full ? ' · waitlist' : ''}</button>`; }).join('');
+    foot = `<span class="note">${opts.length ? seatText() : 'You\'ve got a lift both ways already'}</span>${btns ? `<div class="joinbtns">${btns}</div>` : ''}`;
   }
   return `<article class="trip ${mineDrive || myR ? 'mine' : ''}">
-    <div class="thead"><span class="tdriver">${esc(d.nick)}${mineDrive ? ' (you)' : ''}</span>${car ? `<span class="plate">${esc(car.plate)}</span>` : ''}<span class="dir">${DIRL[t.dir]}</span><span class="seats" aria-label="${conf.length} of ${t.seats} seats taken">${dots}</span></div>
+    <div class="thead"><span class="tdriver">${esc(d.nick)}${mineDrive ? ' (you)' : ''}</span>${car ? `<span class="plate">${esc(car.plate)}</span>` : ''}<span class="dir">${DIRL[t.dir]}</span><span class="seats" aria-label="Seats taken: ${used.in} in, ${used.home} home, of ${t.seats}">${dots}</span></div>
     ${conf.length ? `<div class="chips">${conf.map(r => chip(r, 'conf')).join('')}</div>` : `<div class="quiet" style="padding:0">${past ? 'Drove alone' : 'No passengers yet'}</div>`}
     ${wait.length ? `<div class="wlabel">Waiting</div><div class="chips">${wait.map(r => chip(r, 'wait')).join('')}</div>` : ''}
     <div class="tfoot">${foot}</div></article>`;
@@ -465,14 +555,14 @@ function viewDash(b) {
     <div class="stat"><b class="num">${waiting}</b><span>waiting for a seat</span></div></div>`;
   if (stats.list.length) h += `<div class="sec-h">Driving share</div><div class="rows">${stats.list.slice().reverse().map(x => `<div class="row"><div class="grow"><div style="display:flex;justify-content:space-between;gap:8px"><b>${esc(nick(x.id))}</b><span class="sub num">${fmt(x.drives)} / ${fmt(x.days)} days</span></div><div class="share"><i style="width:${Math.min(100, x.ratio * 100)}%"></i><u style="left:${Math.min(100, stats.avg * 100)}%"></u></div></div></div>`).join('')}</div>
     <p class="note">Bar = share of your office days you drove. The line marks the group average. Driving alone doesn't count, and people who rarely come in aren't penalised.</p>`;
-  const act = S.members.filter(isActive).sort((x, y) => b[y.id] - b[x.id]);
+  const act = people().filter(isActive).sort((x, y) => b[y.id] - b[x.id]);
   h += `<div class="sec-h">Tokens</div><div class="rows">${act.map(x => `<div class="row"><div class="grow"><b>${esc(x.nick)}${x.id === m ? ' (you)' : ''}</b>${x.carId ? '' : '<span class="sub"> · no car</span>'}</div><span class="val num ${b[x.id] < 0 ? 'neg' : ''}">${fmt(b[x.id])}</span></div>`).join('')}</div>`;
   return h;
 }
 
 function viewGroup(b) {
-  const act = S.members.filter(isActive).sort((a, c) => a.nick.localeCompare(c.nick)), q = S.members.filter(m => !isActive(m));
-  const row = m => { const c = carOf(m), shared = c && S.members.filter(x => x.carId === c.id).length > 1;
+  const all = people(), act = all.filter(isActive).sort((a, c) => a.nick.localeCompare(c.nick)), q = all.filter(m => !isActive(m));
+  const row = m => { const c = carOf(m), shared = c && all.filter(x => x.carId === c.id).length > 1;
     return `<button class="row tap" data-a="memberSheet" data-v="${m.id}"><div class="grow"><b>${esc(m.nick)}${m.id === me() ? ' (you)' : ''}</b><div class="sub">${c ? `<span class="plate">${esc(c.plate)}</span> ${c.cap} seats${shared ? ' · shared car' : ''}` : 'No car'}</div></div><span class="val num ${b[m.id] < 0 ? 'neg' : ''}">${fmt(b[m.id])}</span></button>`; };
   const L = S.log[0], canUndo = L && !L.undone && L.who === me() && Date.now() - L.ts < UNDO_MINUTES * 60000 && L.before && L.before !== '{}';
   return `<div class="sec-h" style="margin-top:8px">Invite people</div><div class="invite"><code id="invite">${esc(DEMO ? 'Invite links work once the app is connected' : inviteUrl())}</code><button class="btn sec" data-a="copy">Copy</button></div>
@@ -480,10 +570,13 @@ function viewGroup(b) {
     <div class="sec-h">Members (${act.length})</div><div class="rows">${act.map(row).join('') || '<div class="row note">No one yet.</div>'}</div>
     ${q.length ? `<details><summary>Not in for a while (${q.length}). Their tokens are kept for when they're back.</summary><div class="rows">${q.map(row).join('')}</div></details>` : ''}
     <p class="note">Tap someone to change their car or reset their PIN.</p>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px"><button class="btn pri" data-a="addSheet">Add someone</button><button class="btn ghost" data-a="renameSheet">Rename group</button><a class="btn ghost" href="${location.pathname}">Start another group</a></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px"><button class="btn pri" data-a="addSheet">Add someone</button><button class="btn ghost" data-a="renameSheet">Rename group</button></div>
     <div class="sec-h">Recent activity</div><div class="rows log">${S.log.slice(0, 20).map((l, i) => `<div class="row"><div class="grow"><b>${esc(nick(l.who))}</b> ${esc(l.text)}</div>${i === 0 && canUndo ? '<button class="link" data-a="undo">Undo</button>' : `<time>${ago(l.ts)}</time>`}</div>`).join('') || '<div class="row note">Nothing yet.</div>'}</div>
     <p class="note">Anyone can fix a mistake, and every change shows up here. You can undo your own last change for ${UNDO_MINUTES} minutes.</p>
-    <div style="margin-top:20px"><button class="btn ghost" data-a="logout">${ui.confirm === 'logout' ? 'Tap again to log out' : 'Log out on this phone'}</button></div>`;
+    <div class="sec-h">Your profile</div>
+    <div class="acct"><button class="btn ghost" data-a="logout">${ui.confirm === 'logout' ? 'Tap again to log out' : 'Log out on this phone'}</button>
+    <button class="btn danger" data-a="deleteMe">${ui.confirm === 'delete' ? 'Tap again to delete your profile' : 'Delete my profile'}</button>
+    ${ui.confirm === 'delete' ? '<p class="note">Your nickname is removed and you\'re taken off upcoming lifts. Lifts you were driving are cancelled. Past lifts stay as "Former member" so everyone else\'s tokens add up. This can\'t be undone.</p>' : ''}</div>`;
 }
 
 function viewSheet() {
@@ -497,7 +590,7 @@ function viewSheet() {
       ${s.trip ? `<button class="btn danger block" data-a="cancelTrip">${ui.confirm === 'cancel' ? 'Tap again to cancel this lift' : 'Cancel this lift'}</button>` : ''}`;
   } else if (s.type === 'rider') {
     const t = tripById(s.trip); if (!t) { ui.sheet = null; return ''; }
-    const r = t.riders.find(x => x.id === me()) || {}, opts = t.dir === 'both' ? ['both', 'in', 'home'] : [t.dir];
+    const r = t.riders.find(x => x.id === me()) || {}, opts = dirOptions(LEGS[t.dir].filter(l => !legsTaken(me(), t.date, t.id).has(l)));
     inner = `<h3>${esc(nick(t.driverId))}'s car · ${dLabel(t.date)}</h3>
       ${opts.length > 1 ? `<div class="field"><span>Which way are you riding?</span><div class="seg">${opts.map(d => `<button data-a="setDir" data-v="${d}" data-t="${t.id}" aria-pressed="${r.dir === d}">${d === 'both' ? 'There & back · 1' : d === 'in' ? 'In only · ½' : 'Home only · ½'}</button>`).join('')}</div></div>` : ''}
       <button class="btn danger block" data-a="leave" data-v="${t.id}">Leave this car</button>`;
@@ -507,17 +600,17 @@ function viewSheet() {
     inner = `<h3>Rename group</h3><div class="field"><label for="f-gname">Name</label><input id="f-gname" maxlength="40" value="${esc(s.gname || '')}" autocomplete="off"></div><button class="btn pri block" data-a="saveRename">Save</button>`;
   } else if (s.type === 'member') {
     const fresh = !me() && !s.edit;
-    const shareable = S.cars.filter(c => S.members.some(m => m.carId === c.id && m.id !== s.edit));
+    const shareable = S.cars.filter(c => people().some(m => m.carId === c.id && m.id !== s.edit));
     const title = fresh ? 'Join the lift club' : s.edit ? (s.edit === me() ? 'Your details' : esc(nick(s.edit))) : 'Add someone';
     inner = `<h3>${title}</h3>
       <div class="field"><label for="f-nick">Nickname</label><input id="f-nick" maxlength="20" placeholder="e.g. Mo" value="${esc(s.nick || '')}" autocomplete="off"></div>
       <div class="field"><span>Car</span><div class="seg">${[['none', 'No car'], ['own', 'Own car'], ['share', 'Shares a car']].map(([k, l]) => `<button data-a="acar" data-v="${k}" aria-pressed="${s.car === k}">${l}</button>`).join('')}</div></div>
       ${s.car === 'own' ? `<div class="field"><label for="f-plate">Number plate (helps people spot the car)</label><input id="f-plate" maxlength="12" placeholder="CL 12-345" value="${esc(s.plate || '')}" autocomplete="off"></div>
         <div class="field"><span>People the car fits, driver included</span><div class="stepper"><button data-a="acap" data-v="-1" aria-label="Fewer">−</button><b class="num">${s.cap}</b><button data-a="acap" data-v="1" aria-label="More">+</button></div></div>` : ''}
-      ${s.car === 'share' ? (shareable.length ? `<div class="field"><label for="f-share">Whose car?</label><select id="f-share">${shareable.map(c => `<option value="${c.id}" ${s.share === c.id ? 'selected' : ''}>${esc(S.members.filter(m => m.carId === c.id).map(m => m.nick).join(' & '))} · ${esc(c.plate)}</option>`).join('')}</select></div>` : '<p class="note" style="margin:0">No cars added yet. Choose Own car instead.</p>') : ''}
+      ${s.car === 'share' ? (shareable.length ? `<div class="field"><label for="f-share">Whose car?</label><select id="f-share">${shareable.map(c => `<option value="${c.id}" ${s.share === c.id ? 'selected' : ''}>${esc(people().filter(m => m.carId === c.id).map(m => m.nick).join(' & '))} · ${esc(c.plate)}</option>`).join('')}</select></div>` : '<p class="note" style="margin:0">No cars added yet. Choose Own car instead.</p>') : ''}
       ${fresh ? `<div class="field"><label for="f-pin">Choose a 4-digit PIN</label><input id="f-pin" inputmode="numeric" pattern="[0-9]*" maxlength="4" value="${esc(s.pin || '')}" autocomplete="off"><span class="note">It only stops someone else booking as you. Don't reuse a bank PIN.</span></div>` : ''}
       ${s.err ? `<p class="err">${esc(s.err)}</p>` : ''}
-      ${s.edit ? '' : '<p class="note" style="margin:0">Everyone starts with 5 tokens.</p>'}
+      ${s.edit ? '' : `<p class="note" style="margin:0">Everyone starts with ${START} tokens.</p>`}
       <button class="btn pri block" data-a="saveMember">${fresh ? 'Join' : s.edit ? 'Save' : 'Add to group'}</button>
       ${s.edit && mem(s.edit).pinHash ? `<button class="btn ghost block" data-a="resetPin">${ui.confirm === 'pin' ? 'Tap again to reset the PIN' : 'Reset PIN'}</button>` : ''}`;
   }
@@ -529,20 +622,20 @@ function guideHTML() {
   return `<div class="guide">
   <p class="lede">A fair way to share lifts. Drive and you earn tokens, ride and you spend them. Over time everyone gives about as much as they take.</p>
   <table class="gtable"><thead><tr><th>What happens</th><th class="num">Tokens</th></tr></thead><tbody>
-    <tr><td>You start with</td><td class="num">+5</td></tr>
+    <tr><td>You start with</td><td class="num">+${START}</td></tr>
     <tr><td>Ride there &amp; back</td><td class="num">−1</td></tr>
     <tr><td>Ride one way</td><td class="num">−½</td></tr>
     <tr><td>Drive, per passenger there &amp; back</td><td class="num">+1</td></tr>
     <tr><td>Drive, per passenger one way</td><td class="num">+½</td></tr>
     <tr><td>Drive alone</td><td class="num">0</td></tr></tbody></table>
-  <p class="note">Example: you drive in with three people who all ride home with you too. You earn 3 tokens, and each of them pays 1.</p>
-  ${sec('Getting a lift', ['Open <b>This week</b>, find a car and tap <b>I\'m in</b>.', 'Only riding one way? Tap your name on the car and choose <b>In only</b> or <b>Home only</b>.', 'Plans changed? Tap <b>Leave</b>. If it\'s last-minute, give the driver a heads-up on WhatsApp too.'])}
-  ${sec('Driving', ['Tap <b>I\'m driving</b> on the day. Seats fill in from your car, and you can change them.', 'Posting the lift is the record. Tokens move automatically the evening after the trip, so there\'s nothing to log.', 'If someone didn\'t turn up, tap their name on the past trip so they aren\'t charged.', 'Couples who share a car each count as their own person. Each takes their own turns driving, and each pays when riding.'])}
-  ${sec('When cars fill up', ['Seats go first come, first served to people who have tokens.', 'Out of tokens? You can still book. Your seat is held until <b>9pm the night before</b>, but someone with tokens can take it before then.', 'After 9pm the night before, the list is locked.', 'If people are waiting, the app asks for another car and suggests who\'s next to drive.'])}
+  <p class="note">Example: you drive in with three people who all ride home with you too. You earn 3 tokens, and each of them pays 1. Everyone starts with only ${START}, so offering a lift early on is the easy way to build up a few.</p>
+  ${sec('Getting a lift', ['Open <b>This week</b>, find a car and tap <b>There &amp; back</b>, <b>In</b> or <b>Home</b>.', 'You can ride in with one car and home with another. Once you have a lift one way, other cars only offer you the other direction.', 'Changed your mind? Tap your name on the car to switch direction, or tap <b>Leave</b>. If it\'s last-minute, give the driver a heads-up on WhatsApp too.'])}
+  ${sec('Driving', ['Tap <b>I\'m driving</b> on the day and choose which way you\'re going. Seats fill in from your car, and you can change them.', 'Posting the lift is the record. Tokens move automatically the evening after the trip, so there\'s nothing to log.', 'If someone didn\'t turn up, tap their name on the past trip so they aren\'t charged.', 'Couples who share a car each count as their own person. Each takes their own turns driving, and each pays when riding.'])}
+  ${sec('When cars fill up', ['Seats go first come, first served to people who have tokens. Each direction has its own seats, so a car can be full going in but have space going home.', 'Out of tokens? You can still book. Your seat is held until <b>9pm the night before</b>, but someone with tokens can take it before then.', 'After 9pm the night before, the list is locked.', 'If people are waiting, the app asks for another car and suggests who\'s next to drive.'])}
   ${sec('Who should drive next?', ['The <b>Dashboard</b> shows each driver\'s share: how many of their office days they drove.', '<b>Up next to drive</b> lists the people furthest behind. If your name is there, offer next time you go in.', 'It counts only days you actually come in, so weeks of working from home don\'t count against you. Driving alone doesn\'t count either.'])}
   ${sec('Going below zero', ['That\'s fine. You\'ll still get lifts, just after people with tokens when cars are full.', 'If you have a car, offering a lift is the quickest way back up.', 'If you don\'t have a car, your balance will drift down over time. That\'s expected.'])}
   ${sec('Keeping it fair', ['There\'s no admin. Anyone can add people, fix a trip or change someone\'s car details.', 'Every change shows under <b>Recent activity</b> in Group, so it stays honest.', 'Haven\'t been in for four weeks? You drop off the lists, and your tokens wait for you.'])}
-  ${sec('Joining', ['Open the invite link from the WhatsApp group, tap <b>I\'m new here</b>, and pick a nickname and a 4-digit PIN.', 'No real names, emails or phone numbers needed. You stay logged in on your phone.', 'Tip: add the page to your home screen so it opens like an app.'])}
+  ${sec('Joining and leaving', ['Open the invite link from the WhatsApp group, tap <b>I\'m new here</b>, and pick a nickname and a 4-digit PIN.', 'No real names, emails or phone numbers needed. You stay logged in on your phone.', 'Leaving for good? <b>Group → Delete my profile</b> removes your nickname. Your past lifts stay as "Former member" so everyone else\'s tokens still add up.', 'Tip: add the page to your home screen so it opens like an app.'])}
   ${sec('What stays on WhatsApp', ['Departure times, pick-up spots and "running late" messages. The app only keeps track of who\'s driving, who\'s riding and the tokens.'])}
   </div>`;
 }
@@ -568,14 +661,14 @@ function demoSeed() {
       trips.push(t);
     });
   }
-  // upcoming lifts on the next two office days, including one that's oversubscribed
   const up = []; for (let k = 0; up.length < 2 && k < 14; k++) { const d = addDays(today, k); if (d.getDay() === 2 || d.getDay() === 4) up.push(ymd(d)); }
-  const now = Date.now(), mk = (date, driverId, seats, riders) => trips.push({ id: 't' + tid++, date, driverId, dir: 'both', seats, created: now - 5 * 3600e3 + tid,
-    riders: riders.map(([id, prio, dir], i) => ({ id, prio, dir: dir || 'both', ts: now - 4 * 3600e3 + i * 6e5 })) });
-  mk(up[0], 'm3', 6, [['m4', true], ['m11', false], ['m13', false]]);
+  const now = Date.now(), mk = (date, driverId, seats, riders, dir = 'both') => trips.push({ id: 't' + tid++, date, driverId, dir, seats, created: now - 5 * 3600e3 + tid,
+    riders: riders.map(([id, prio, rd], i) => ({ id, prio, dir: rd || dir, ts: now - 4 * 3600e3 + i * 6e5 })) });
+  mk(up[0], 'm3', 6, [['m4', true], ['m11', false], ['m13', false, 'in']]);
   mk(up[0], 'm6', 2, [['m10', true], ['m7', true, 'in']]);
   mk(up[1], 'm1', 4, [['m2', true], ['m12', false], ['m11', false], ['m5', true], ['m4', true], ['m13', false]]);
-  return { group: { name: 'Deep South Lift Club' }, members, cars, trips, log: [] };
+  mk(up[1], 'm10', 3, [['m7', true]], 'home');
+  return { group: { name: 'Deep South Lift Club', summary: emptySummary() }, members, cars, trips, log: [] };
 }
 
 /* ---------- boot ---------- */
@@ -588,11 +681,14 @@ function demoSeed() {
   if (!store) return;
   try { await store.ready; } catch (e) { console.error(e); loadErr = 'Couldn\'t sign in to Firebase. Check that Anonymous sign-in is turned on (SETUP.md, step 4).'; render(); return; }
   if (!GID) { render(); return; }
-  if (!DEMO) ls.set('dslc:last', GID);
   const savedMe = ls.get(meKey());
   store.watch(GID, st => {
+    if (st.group && !DEMO) ls.set('dslc:last', GID);
     const meId = S ? S.meId : savedMe;
     S = { ...st, meId };
+    // once per visit, tidy lifts older than five weeks into the saved summary
+    if (st.group && !rolledUp) { rolledUp = true; const until = ymd(mondayOf(addDays(new Date(), -KEEP_DAYS)));
+      if (summary().through < until) store.rollup(GID, until).catch(e => console.warn('summary update skipped', e)); }
     const ae = document.activeElement; if (!(ae && (ae.tagName === 'INPUT' || ae.tagName === 'SELECT'))) render();
   }, e => { console.error(e); loadErr = e && e.code === 'permission-denied' ? 'Firebase refused access. Check the security rules were published (SETUP.md, step 5).' : 'Lost the connection to the lift club. Reload the page to try again.'; render(); });
   setInterval(() => { if (ymd(new Date()) !== TODAY) render(); }, 60000);

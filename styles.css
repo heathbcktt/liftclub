@@ -162,3 +162,10 @@ details summary{cursor:pointer;color:var(--muted);font-size:13.5px;padding:10px 
 .pin.shake{animation:shake .3s}
 @keyframes shake{25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
 @media (prefers-reduced-motion:reduce){.pin.shake{animation:none}}
+.joinbtns{display:flex;flex-wrap:wrap;gap:6px}
+.joinbtns .btn{padding:8px 12px;font-size:13.5px}
+.legdots{display:flex;flex-direction:column;gap:3px;align-items:flex-end}
+.legdots>span{display:flex;gap:3px;align-items:center}
+.legdots small{font-size:10px;color:var(--muted);margin-right:3px;font-weight:600}
+.acct{display:flex;flex-direction:column;align-items:flex-start;gap:10px}
+.acct .note{margin:0;max-width:60ch}
