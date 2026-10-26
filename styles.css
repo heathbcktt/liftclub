@@ -169,3 +169,22 @@ details summary{cursor:pointer;color:var(--muted);font-size:13.5px;padding:10px 
 .legdots small{font-size:10px;color:var(--muted);margin-right:3px;font-weight:600}
 .acct{display:flex;flex-direction:column;align-items:flex-start;gap:10px}
 .acct .note{margin:0;max-width:60ch}
+
+/* ornament: little cars and the Deep South scenery */
+:root{--sea:#D4E8EC;--sand:#F2E3C2;--hut-r:#D0543E;--hut-y:#E6B42C;--hut-b:#3B7DB6;--hut-g:#3C976B}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--sea:#183238;--sand:#3A3121;--hut-r:#E07562;--hut-y:#EDC456;--hut-b:#6CA3D6;--hut-g:#62B98F}}
+:root[data-theme="dark"]{--sea:#183238;--sand:#3A3121;--hut-r:#E07562;--hut-y:#EDC456;--hut-b:#6CA3D6;--hut-g:#62B98F}
+.car{width:22px;height:12px;flex:none}
+.car path{fill:var(--accent)}
+.car circle{fill:var(--surface);stroke:var(--accent);stroke-width:1.2}
+.car.past path{fill:var(--muted)}
+.car.past circle{stroke:var(--muted)}
+.car.parked{width:26px;height:14px}
+.car.parked path,.car.parked circle{fill:none;stroke:var(--muted);stroke-width:1}
+.parkedrow{display:inline-flex;align-items:center;gap:8px}
+.scenery{display:block;width:100%;height:auto;margin-top:18px}
+.scenery .mtn{fill:var(--muted);opacity:.14}
+.scenery .sea{fill:var(--sea)}
+.scenery .sand{fill:var(--sand)}
+.scenery .hut.r{fill:var(--hut-r)}.scenery .hut.y{fill:var(--hut-y)}.scenery .hut.b{fill:var(--hut-b)}.scenery .hut.g{fill:var(--hut-g)}
+.scenery .hut .door{fill:var(--surface)}

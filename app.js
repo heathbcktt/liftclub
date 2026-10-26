@@ -6,7 +6,9 @@
 const START = 3, QUIET_DAYS = 28, UNDO_MINUTES = 10, KEEP_DAYS = 35, WEEKS_BACK = 2, WEEKS_AHEAD = 2;
 const COST = { both: 1, in: .5, home: .5 };
 const LEGS = { both: ['in', 'home'], in: ['in'], home: ['home'] };
-const DIRL = { both: 'There & back', in: 'Morning in only', home: 'Home only' };
+const DIRL = { both: 'There & back', in: 'To work only', home: 'Back home only' };
+const BTN = { both: 'There & back · 1', in: 'To work · ½', home: 'Back home · ½' };
+const CAR = (cls = '') => `<svg class="car ${cls}" viewBox="0 0 23 12" aria-hidden="true"><path d="M0 9 L2 4 Q3 2 6 2 L13 2 Q15 2 17 5 L21 6 Q23 7 23 9 L23 10 L0 10 Z"/><circle cx="5" cy="10.5" r="1.6"/><circle cx="18" cy="10.5" r="1.6"/></svg>`;
 const DAYN = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -226,7 +228,7 @@ const H = {
     const dir = el.dataset.d, t = tripById(id), m = me(); if (!t || !m) return;
     const prio = (ledger()[m] - committed(m)) > 0;
     const willWait = alloc({ ...t, riders: [...(t.riders || []), { id: m, ts: Date.now(), prio, dir }] }).wait.some(r => r.id === m);
-    const what = dir === 'both' ? '' : dir === 'in' ? ' (in only)' : ' (home only)';
+    const what = dir === 'both' ? '' : dir === 'in' ? ' (to work only)' : ' (back home only)';
     // a waitlist spot elsewhere for the same direction gets dropped when you take this seat
     const others = S.trips.filter(x => x.date === t.date && x.id !== id && (x.riders || []).some(r => r.id === m && LEGS[r.dir].some(l => LEGS[dir].includes(l))));
     act(`joined ${nick(t.driverId)}'s car for ${dLabel(t.date)}${what}`, [{ col: 'trips', id }, ...others.map(x => ({ col: 'trips', id: x.id }))], docs => {
@@ -480,7 +482,7 @@ function viewWeek() {
         const next = stats.list.filter(x => !trips.some(t => t.driverId === x.id || mem(t.driverId).carId === mem(x.id).carId)).slice(0, 3).map(x => esc(nick(x.id)));
         body += `<div class="banner"><div><b>${waiting} ${waiting === 1 ? 'person is' : 'people are'} waiting for a seat.</b> Another car would sort it out.${next.length ? ` Next up to drive: ${next.join(', ')}.` : ''}</div>${myCar && !iDrive && !carBusy ? `<div><button class="btn pri" data-a="offer" data-v="${ds}">I'll take my car</button></div>` : ''}</div>`;
       } else if (!trips.length) {
-        body += `<div class="offer"><span class="quiet">Nobody's driving yet.</span>${myCar && !carBusy ? `<button class="btn sec" data-a="offer" data-v="${ds}">I'm driving</button>` : ''}</div>`;
+        body += `<div class="offer"><span class="quiet parkedrow">${CAR('parked')}Nobody's driving yet.</span>${myCar && !carBusy ? `<button class="btn sec" data-a="offer" data-v="${ds}">I'm driving</button>` : ''}</div>`;
       } else if (myCar && !iDrive && !carBusy) {
         body += `<button class="link" style="align-self:flex-start" data-a="offer" data-v="${ds}">+ I'm driving too</button>`;
       }
@@ -488,8 +490,17 @@ function viewWeek() {
     const d = parse(ds);
     h += `<section class="day ${past ? 'past' : ''}"><div><div class="dname">${DAYN[d.getDay()]}</div><div class="ddate">${d.getDate()} ${MON[d.getMonth()]}</div>${ds === TODAY ? '<span class="today">Today</span>' : ''}</div><div class="dbody">${body}</div></section>`;
   }
-  return h;
+  return h + SCENERY;
 }
+
+// Table Mountain, the sea and a row of Muizenberg beach huts at the foot of the week
+const hut = (x, y, c) => `<g transform="translate(${x} ${y})" class="hut ${c}"><path d="M0 4 L4 0 L8 4 Z"/><rect x=".5" y="4" width="7" height="7"/><rect class="door" x="3" y="7" width="2" height="4"/></g>`;
+const SCENERY = `<svg class="scenery" viewBox="0 0 300 58" aria-hidden="true">
+  <path class="mtn" d="M0 30 L26 25 L42 12 L52 16 L62 8 L150 7 L160 13 L176 20 L198 18 L210 10 L218 9 L226 14 L242 22 L270 26 L300 28 L300 58 L0 58 Z"/>
+  <path class="sea" d="M0 40 Q10 37 20 40 T40 40 T60 40 T80 40 T100 40 T120 40 T140 40 T160 40 T180 40 T200 40 T220 40 T240 40 T260 40 T280 40 T300 40 L300 58 L0 58 Z"/>
+  <path class="sand" d="M120 58 Q190 43 300 45 L300 58 Z"/>
+  ${hut(178, 38, 'r')}${hut(191, 37.5, 'y')}${hut(204, 37, 'b')}${hut(217, 36.6, 'g')}${hut(230, 36.4, 'y')}${hut(243, 36.3, 'r')}
+</svg>`;
 
 function tripCard(t, past) {
   const { conf, wait, used } = alloc(t), d = mem(t.driverId), car = carOf(d), m = me(), mineDrive = t.driverId === m;
@@ -497,7 +508,7 @@ function tripCard(t, past) {
   const free = { in: t.seats - used.in, home: t.seats - used.home };
   const chip = (r, kind) => {
     const isMe = r.id === m, prov = kind === 'conf' && !r.prio && beforeCut && !past;
-    const extra = r.dir !== t.dir ? `<small>${r.dir === 'in' ? 'in only' : 'home only'}</small>` : '';
+    const extra = r.dir !== t.dir ? `<small>${r.dir === 'in' ? 'to work only' : 'back home only'}</small>` : '';
     const cls = `chip ${isMe ? 'me' : ''} ${prov ? 'prov' : ''} ${r.noShow ? 'noshow' : ''}`, label = esc(nick(r.id)) + extra;
     if (past && mineDrive && kind === 'conf') return `<button class="${cls}" data-a="noShow" data-v="${r.id}" data-t="${t.id}" title="Tap if they didn't come">${label}</button>`;
     if (!past && isMe) return `<button class="${cls}" data-a="riderSheet" data-v="${t.id}">${label} ▾</button>`;
@@ -506,12 +517,12 @@ function tripCard(t, past) {
   // seat dots: one row per direction when the two directions differ
   const dotRow = n => Array.from({ length: t.seats }, (_, i) => `<span class="seat ${i < n ? 'on' : ''}"></span>`).join('');
   const split = t.dir === 'both' && used.in !== used.home;
-  const dots = split ? `<span class="legdots"><span><small>In</small>${dotRow(used.in)}</span><span><small>Home</small>${dotRow(used.home)}</span></span>` : dotRow(Math.max(used.in, used.home));
+  const dots = split ? `<span class="legdots"><span><small>Work</small>${dotRow(used.in)}</span><span><small>Home</small>${dotRow(used.home)}</span></span>` : dotRow(Math.max(used.in, used.home));
   const seatText = () => {
     const s = n => `${n} seat${n === 1 ? '' : 's'}`;
     if (t.dir !== 'both') { const f = free[t.dir]; return f > 0 ? `${s(f)} left` : 'Full'; }
     if (free.in === free.home) return free.in > 0 ? `${s(free.in)} left` : 'Full';
-    return `${free.in > 0 ? s(free.in) : 'Full'} in, ${free.home > 0 ? s(free.home) : 'full'} home`;
+    return `${free.in > 0 ? s(free.in) : 'Full'} to work, ${free.home > 0 ? s(free.home) : 'full'} home`;
   };
   let foot = '';
   if (past) {
@@ -527,13 +538,12 @@ function tripCard(t, past) {
   } else {
     // offer only the directions you haven't already got covered in another car
     const taken = legsTaken(m, t.date, t.id), opts = dirOptions(tl.filter(l => !taken.has(l)));
-    const label = { both: 'There & back · 1', in: 'In · ½', home: 'Home · ½' };
     const btns = opts.map(o => { const full = LEGS[o].some(l => free[l] <= 0);
-      return `<button class="btn ${full ? 'ghost' : o === 'both' ? 'pri' : 'sec'}" data-a="join" data-v="${t.id}" data-d="${o}">${label[o]}${full ? ' · waitlist' : ''}</button>`; }).join('');
+      return `<button class="btn ${full ? 'ghost' : o === 'both' ? 'pri' : 'sec'}" data-a="join" data-v="${t.id}" data-d="${o}">${BTN[o]}${full ? ' · waitlist' : ''}</button>`; }).join('');
     foot = `<span class="note">${opts.length ? seatText() : 'You\'ve got a lift both ways already'}</span>${btns ? `<div class="joinbtns">${btns}</div>` : ''}`;
   }
   return `<article class="trip ${mineDrive || myR ? 'mine' : ''}">
-    <div class="thead"><span class="tdriver">${esc(d.nick)}${mineDrive ? ' (you)' : ''}</span>${car ? `<span class="plate">${esc(car.plate)}</span>` : ''}<span class="dir">${DIRL[t.dir]}</span><span class="seats" aria-label="Seats taken: ${used.in} in, ${used.home} home, of ${t.seats}">${dots}</span></div>
+    <div class="thead">${CAR(past ? 'past' : '')}<span class="tdriver">${esc(d.nick)}${mineDrive ? ' (you)' : ''}</span>${car ? `<span class="plate">${esc(car.plate)}</span>` : ''}<span class="dir">${DIRL[t.dir]}</span><span class="seats" aria-label="Seats taken: ${used.in} to work, ${used.home} home, of ${t.seats}">${dots}</span></div>
     ${conf.length ? `<div class="chips">${conf.map(r => chip(r, 'conf')).join('')}</div>` : `<div class="quiet" style="padding:0">${past ? 'Drove alone' : 'No passengers yet'}</div>`}
     ${wait.length ? `<div class="wlabel">Waiting</div><div class="chips">${wait.map(r => chip(r, 'wait')).join('')}</div>` : ''}
     <div class="tfoot">${foot}</div></article>`;
@@ -584,7 +594,7 @@ function viewSheet() {
   if (s.type === 'post') {
     const max = carOf(mem(me())).cap - 1;
     inner = `<h3>${s.trip ? 'Edit your lift' : "You're driving"} · ${dLabel(s.date)}</h3>
-      <div class="field"><span>Which way?</span><div class="seg">${['both', 'in', 'home'].map(d => `<button data-a="sdir" data-v="${d}" aria-pressed="${s.dir === d}">${d === 'both' ? 'There & back' : d === 'in' ? 'In only' : 'Home only'}</button>`).join('')}</div></div>
+      <div class="field"><span>Which way?</span><div class="seg">${['both', 'in', 'home'].map(d => `<button data-a="sdir" data-v="${d}" aria-pressed="${s.dir === d}">${d === 'both' ? 'There & back' : d === 'in' ? 'To work' : 'Back home'}</button>`).join('')}</div></div>
       <div class="field"><span>Seats for passengers</span><div class="stepper"><button data-a="sseat" data-v="-1" aria-label="Fewer seats">−</button><b class="num">${s.seats}</b><button data-a="sseat" data-v="1" aria-label="More seats">+</button><span class="note">Your car takes ${max} passenger${max === 1 ? '' : 's'}</span></div></div>
       <button class="btn pri block" data-a="savePost">${s.trip ? 'Save changes' : 'Post my lift'}</button>
       ${s.trip ? `<button class="btn danger block" data-a="cancelTrip">${ui.confirm === 'cancel' ? 'Tap again to cancel this lift' : 'Cancel this lift'}</button>` : ''}`;
@@ -592,7 +602,7 @@ function viewSheet() {
     const t = tripById(s.trip); if (!t) { ui.sheet = null; return ''; }
     const r = t.riders.find(x => x.id === me()) || {}, opts = dirOptions(LEGS[t.dir].filter(l => !legsTaken(me(), t.date, t.id).has(l)));
     inner = `<h3>${esc(nick(t.driverId))}'s car · ${dLabel(t.date)}</h3>
-      ${opts.length > 1 ? `<div class="field"><span>Which way are you riding?</span><div class="seg">${opts.map(d => `<button data-a="setDir" data-v="${d}" data-t="${t.id}" aria-pressed="${r.dir === d}">${d === 'both' ? 'There & back · 1' : d === 'in' ? 'In only · ½' : 'Home only · ½'}</button>`).join('')}</div></div>` : ''}
+      ${opts.length > 1 ? `<div class="field"><span>Which way are you riding?</span><div class="seg">${opts.map(d => `<button data-a="setDir" data-v="${d}" data-t="${t.id}" aria-pressed="${r.dir === d}">${BTN[d]}</button>`).join('')}</div></div>` : ''}
       <button class="btn danger block" data-a="leave" data-v="${t.id}">Leave this car</button>`;
   } else if (s.type === 'guide') {
     inner = guideHTML() + '<button class="btn pri block" data-a="closeSheet">Got it</button>';
@@ -629,9 +639,9 @@ function guideHTML() {
     <tr><td>Drive, per passenger one way</td><td class="num">+½</td></tr>
     <tr><td>Drive alone</td><td class="num">0</td></tr></tbody></table>
   <p class="note">Example: you drive in with three people who all ride home with you too. You earn 3 tokens, and each of them pays 1. Everyone starts with only ${START}, so offering a lift early on is the easy way to build up a few.</p>
-  ${sec('Getting a lift', ['Open <b>This week</b>, find a car and tap <b>There &amp; back</b>, <b>In</b> or <b>Home</b>.', 'You can ride in with one car and home with another. Once you have a lift one way, other cars only offer you the other direction.', 'Changed your mind? Tap your name on the car to switch direction, or tap <b>Leave</b>. If it\'s last-minute, give the driver a heads-up on WhatsApp too.'])}
+  ${sec('Getting a lift', ['Open <b>This week</b>, find a car and tap <b>There &amp; back</b>, <b>To work</b> or <b>Back home</b>.', 'You can ride to work with one car and back home with another. Once you have a lift one way, other cars only offer you the other direction.', 'Changed your mind? Tap your name on the car to switch direction, or tap <b>Leave</b>. If it\'s last-minute, give the driver a heads-up on WhatsApp too.'])}
   ${sec('Driving', ['Tap <b>I\'m driving</b> on the day and choose which way you\'re going. Seats fill in from your car, and you can change them.', 'Posting the lift is the record. Tokens move automatically the evening after the trip, so there\'s nothing to log.', 'If someone didn\'t turn up, tap their name on the past trip so they aren\'t charged.', 'Couples who share a car each count as their own person. Each takes their own turns driving, and each pays when riding.'])}
-  ${sec('When cars fill up', ['Seats go first come, first served to people who have tokens. Each direction has its own seats, so a car can be full going in but have space going home.', 'Out of tokens? You can still book. Your seat is held until <b>9pm the night before</b>, but someone with tokens can take it before then.', 'After 9pm the night before, the list is locked.', 'If people are waiting, the app asks for another car and suggests who\'s next to drive.'])}
+  ${sec('When cars fill up', ['Seats go first come, first served to people who have tokens. Each direction has its own seats, so a car can be full on the way to work but have space on the way home.', 'Out of tokens? You can still book. Your seat is held until <b>9pm the night before</b>, but someone with tokens can take it before then.', 'After 9pm the night before, the list is locked.', 'If people are waiting, the app asks for another car and suggests who\'s next to drive.'])}
   ${sec('Who should drive next?', ['The <b>Dashboard</b> shows each driver\'s share: how many of their office days they drove.', '<b>Up next to drive</b> lists the people furthest behind. If your name is there, offer next time you go in.', 'It counts only days you actually come in, so weeks of working from home don\'t count against you. Driving alone doesn\'t count either.'])}
   ${sec('Going below zero', ['That\'s fine. You\'ll still get lifts, just after people with tokens when cars are full.', 'If you have a car, offering a lift is the quickest way back up.', 'If you don\'t have a car, your balance will drift down over time. That\'s expected.'])}
   ${sec('Keeping it fair', ['There\'s no admin. Anyone can add people, fix a trip or change someone\'s car details.', 'Every change shows under <b>Recent activity</b> in Group, so it stays honest.', 'Haven\'t been in for four weeks? You drop off the lists, and your tokens wait for you.'])}
